@@ -29,8 +29,25 @@ fn _get_db_version(conn: &Connection) -> i32 {
  * 2: Added 'data' field to 'buckets' table
  * 3: see: https://github.com/ActivityWatch/aw-server-rust/pull/52
  * 4: Added 'key_value' table for storing key - value pairs
+ * 5: Added composite index for bucket-scoped event time overlap queries
  */
-static NEWEST_DB_VERSION: i32 = 4;
+static NEWEST_DB_VERSION: i32 = 5;
+#[cfg(test)]
+const EVENT_QUERY_INDEX_NAME: &str = "events_bucketrow_endtime_starttime_index";
+const GET_EVENTS_SQL: &str = "
+                SELECT id, starttime, endtime, data
+                FROM events INDEXED BY events_bucketrow_endtime_starttime_index
+                WHERE bucketrow = ?1
+                    AND endtime >= ?2
+                    AND starttime <= ?3
+                ORDER BY starttime DESC
+                LIMIT ?4
+            ;";
+const GET_EVENT_COUNT_SQL: &str = "
+            SELECT count(*) FROM events INDEXED BY events_bucketrow_endtime_starttime_index
+            WHERE bucketrow = ?1
+                AND endtime >= ?2
+                AND starttime <= ?3";
 
 fn _create_tables(conn: &Connection, version: i32) -> bool {
     let mut first_init = false;
@@ -50,6 +67,10 @@ fn _create_tables(conn: &Connection, version: i32) -> bool {
 
     if version < 4 {
         _migrate_v3_to_v4(conn);
+    }
+
+    if version < 5 {
+        _migrate_v4_to_v5(conn);
     }
 
     first_init
@@ -166,6 +187,18 @@ fn _migrate_v3_to_v4(conn: &Connection) {
     .expect("Failed to upgrade db and add key-value storage table");
 
     conn.pragma_update(None, "user_version", 4)
+        .expect("Failed to update database version!");
+}
+
+fn _migrate_v4_to_v5(conn: &Connection) {
+    info!("Upgrading database to v5, adding event query composite index");
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS events_bucketrow_endtime_starttime_index ON events(bucketrow, endtime, starttime)",
+        [],
+    )
+    .expect("Failed to create events_bucketrow_endtime_starttime index");
+
+    conn.pragma_update(None, "user_version", 5)
         .expect("Failed to update database version!");
 }
 
@@ -726,17 +759,7 @@ impl DatastoreInstance {
             None => -1,
         };
 
-        let mut stmt = match conn.prepare(
-            "
-                SELECT id, starttime, endtime, data
-                FROM events
-                WHERE bucketrow = ?1
-                    AND endtime >= ?2
-                    AND starttime <= ?3
-                ORDER BY starttime DESC
-                LIMIT ?4
-            ;",
-        ) {
+        let mut stmt = match conn.prepare(GET_EVENTS_SQL) {
             Ok(stmt) => stmt,
             Err(err) => {
                 return Err(DatastoreError::InternalError(format!(
@@ -818,13 +841,7 @@ impl DatastoreInstance {
             return Ok(0);
         }
 
-        let mut stmt = match conn.prepare(
-            "
-            SELECT count(*) FROM events
-            WHERE bucketrow = ?1
-                AND endtime >= ?2
-                AND starttime <= ?3",
-        ) {
+        let mut stmt = match conn.prepare(GET_EVENT_COUNT_SQL) {
             Ok(stmt) => stmt,
             Err(err) => {
                 return Err(DatastoreError::InternalError(format!(
@@ -949,5 +966,18 @@ impl DatastoreInstance {
                 )),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_query_sql_uses_composite_index() {
+        let indexed_by = format!("INDEXED BY {EVENT_QUERY_INDEX_NAME}");
+
+        assert!(GET_EVENTS_SQL.contains(&indexed_by));
+        assert!(GET_EVENT_COUNT_SQL.contains(&indexed_by));
     }
 }
