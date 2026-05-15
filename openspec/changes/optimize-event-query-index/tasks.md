@@ -21,7 +21,7 @@
 
 - [x] 4.1 Do not rely on local Rust tooling; assume no local `cargo`, `rustc`, or Rust formatter is available.
 - [x] 4.2 Review the changed Rust files textually for obvious syntax, import, and formatting issues before pushing.
-- [ ] 4.3 Push the implementation branch and use GitHub Actions CI as the authoritative formatting, build, and test verification path.
+- [x] 4.3 Push the implementation branch and use GitHub Actions CI as the authoritative formatting, build, and test verification path.
 - [x] 4.4 Confirm CI runs the relevant Rust formatting, build, and test jobs for `aw-datastore` or the workspace.
 - [ ] 4.5 Inspect failed CI logs, adjust the implementation or tests locally as plain text edits, and rerun CI until the required jobs pass.
 - [x] 4.6 Document manual production rollout precautions: stop ActivityWatch, back up `sqlite.db`, start the GitHub Actions-built server binary, and verify representative `EXPLAIN QUERY PLAN` output.
