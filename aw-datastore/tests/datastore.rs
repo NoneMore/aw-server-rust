@@ -11,9 +11,11 @@ extern crate dirs;
 mod datastore_tests {
     use chrono::Duration;
     use chrono::Utc;
+    use rusqlite::Connection;
     use serde_json::json;
 
     use aw_datastore::Datastore;
+    use aw_datastore::DatastoreInstance;
 
     use aw_models::Bucket;
     use aw_models::BucketMetadata;
@@ -58,6 +60,93 @@ mod datastore_tests {
         let bucket = test_bucket();
         ds.create_bucket(&bucket).unwrap();
         bucket
+    }
+
+    fn get_database_version(conn: &Connection) -> i32 {
+        conn.pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    }
+
+    fn event_query_index_columns(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("PRAGMA index_info(events_bucketrow_endtime_starttime_index)")
+            .unwrap();
+        let columns = stmt.query_map([], |row| row.get(2)).unwrap();
+        columns.map(|column| column.unwrap()).collect()
+    }
+
+    fn assert_event_query_index_exists(conn: &Connection) {
+        assert_eq!(
+            event_query_index_columns(conn),
+            vec![
+                "bucketrow".to_string(),
+                "endtime".to_string(),
+                "starttime".to_string()
+            ]
+        );
+    }
+
+    fn create_v4_schema_without_event_query_index(conn: &Connection) {
+        conn.execute_batch(
+            "
+            CREATE TABLE buckets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                type TEXT NOT NULL,
+                client TEXT NOT NULL,
+                hostname TEXT NOT NULL,
+                created TEXT NOT NULL,
+                data_deprecated TEXT DEFAULT '{}',
+                data TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS bucket_id_index ON buckets(id);
+
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bucketrow INTEGER NOT NULL,
+                starttime INTEGER NOT NULL,
+                endtime INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                FOREIGN KEY (bucketrow) REFERENCES buckets(id)
+            );
+            CREATE INDEX IF NOT EXISTS events_bucketrow_index ON events(bucketrow);
+            CREATE INDEX IF NOT EXISTS events_starttime_index ON events(starttime);
+            CREATE INDEX IF NOT EXISTS events_endtime_index ON events(endtime);
+
+            CREATE TABLE key_value (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                last_modified NUMBER NOT NULL
+            );
+
+            PRAGMA user_version = 4;
+            ",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_fresh_database_creates_event_query_index() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        let _ds = DatastoreInstance::new(&conn, true).unwrap();
+
+        assert_eq!(get_database_version(&conn), 5);
+        assert_event_query_index_exists(&conn);
+    }
+
+    #[test]
+    fn test_v4_database_migrates_to_v5_with_event_query_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_v4_schema_without_event_query_index(&conn);
+
+        assert_eq!(get_database_version(&conn), 4);
+        assert!(event_query_index_columns(&conn).is_empty());
+
+        let _ds = DatastoreInstance::new(&conn, true).unwrap();
+
+        assert_eq!(get_database_version(&conn), 5);
+        assert_event_query_index_exists(&conn);
     }
 
     #[test]
