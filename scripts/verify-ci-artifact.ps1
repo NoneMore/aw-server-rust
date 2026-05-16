@@ -360,14 +360,18 @@ function Download-Artifact {
     Write-Log "Extracting artifact zip"
     Expand-Archive -LiteralPath $zipPath -DestinationPath $downloadPath -Force
 
-    $binary = Get-ChildItem -LiteralPath $downloadPath -Recurse -Filter aw-server.exe |
+    $binary = Get-ChildItem -LiteralPath $downloadPath -Recurse -Filter aw-server-rust.exe |
         Select-Object -First 1
     if (-not $binary) {
-        throw "Artifact '$ArtifactName' did not contain aw-server.exe under $downloadPath"
+        $binary = Get-ChildItem -LiteralPath $downloadPath -Recurse -Filter aw-server.exe |
+            Select-Object -First 1
+    }
+    if (-not $binary) {
+        throw "Artifact '$ArtifactName' did not contain aw-server-rust.exe or aw-server.exe under $downloadPath"
     }
 
     $binarySizeMb = [math]::Round($binary.Length / 1MB, 2)
-    Write-Log "Found aw-server.exe at $($binary.FullName) ($binarySizeMb MB)"
+    Write-Log "Found $($binary.Name) at $($binary.FullName) ($binarySizeMb MB)"
     $binary.FullName
 }
 
@@ -689,7 +693,7 @@ try {
     }
 
     $binary = Download-Artifact -ResolvedRunId $RunId -Destination $DownloadDir
-    Write-Log "Downloaded aw-server.exe: $binary"
+    Write-Log "Downloaded aw-server binary: $binary"
 
     Remove-InRepoDirectory $WorkDir
     New-Item -ItemType Directory -Force $WorkPath | Out-Null

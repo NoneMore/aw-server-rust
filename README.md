@@ -7,7 +7,7 @@ A reimplementation of aw-server in Rust.
 
 ## Branch notes
 
-This branch, `my-v0.13.2-server-patch`, is tuned for a local Windows ActivityWatch setup. Its main goal is to make event range queries fast on large SQLite databases, while keeping CI small and focused on what this fork needs.
+This branch, `my-v0.13.2-server-patch`, is tuned for a local Windows ActivityWatch v0.13.2 setup. Its main goal is to make event range queries fast on large SQLite databases, while producing a replacement `aw-server-rust.exe` that can be dropped into an installed ActivityWatch v0.13.2 directory.
 
 ### What changed
 
@@ -15,7 +15,7 @@ This branch, `my-v0.13.2-server-patch`, is tuned for a local Windows ActivityWat
 - A composite index was added: `events_bucketrow_endtime_starttime_index` on `events(bucketrow, endtime, starttime)`.
 - `get_events` and `get_event_count` explicitly use the composite index so large-bucket queries do not fall back to inefficient plans.
 - Datastore tests cover fresh database creation, v4 to v5 migration, index column order, and the SQL index constraint.
-- GitHub Actions was reduced to a lightweight CI setup: Windows builds `aw-server` and runs `aw-datastore` tests; Linux runs `fmt` and `clippy`.
+- GitHub Actions was reduced to a focused CI setup: Windows builds a release `aw-server-rust.exe` with the v0.13.2 web UI embedded and runs `aw-datastore` tests; Linux runs `fmt` and `clippy`.
 - `scripts/verify-ci-artifact.ps1` downloads the cloud-built artifact and verifies it locally against a fresh database, with an optional production database copy check.
 
 ### Why this changed
@@ -34,17 +34,24 @@ These numbers are local validation results, not a cross-machine performance guar
 
 ### Cloud build
 
-The GitHub Actions `Build` workflow runs these commands on a Windows runner:
+The GitHub Actions `Build` workflow creates a binary compatible with the official ActivityWatch v0.13.2 Windows install. It checks out the `aw-webui` submodule, builds `aw-webui/dist`, makes the Rust server report version `0.13.2`, then builds the release server:
 
-```powershell
-cargo build -p aw-server --verbose
+```bash
+cd aw-webui
+npm ci
+mkdir -p static
+cp media/logo/logo.png static/logo.png
+cp media/logo/logo.svg static/logo.svg
+npm run build
+cd ..
+cargo build -p aw-server --release --bin aw-server --verbose
 cargo test -p aw-datastore --verbose
 ```
 
 On success, it uploads this artifact:
 
 ```text
-binaries-Windows/aw-server.exe
+binaries-Windows/aw-server-rust.exe
 ```
 
 Trigger a cloud build for this branch:
@@ -69,10 +76,31 @@ Development build:
 cargo build -p aw-server
 ```
 
-Release build:
+Installer-compatible replacement build:
 
 ```powershell
-cargo build -p aw-server --release
+git submodule update --init --recursive aw-webui
+
+Push-Location .\aw-webui
+npm ci
+New-Item -ItemType Directory -Force .\static
+Copy-Item .\media\logo\logo.png .\static\logo.png
+Copy-Item .\media\logo\logo.svg .\static\logo.svg
+npm run build
+Pop-Location
+
+$manifest = "aw-server\Cargo.toml"
+$lines = Get-Content -LiteralPath $manifest
+for ($i = 0; $i -lt $lines.Count; $i++) {
+  if ($lines[$i] -match '^version = ') {
+    $lines[$i] = 'version = "0.13.2"'
+    break
+  }
+}
+Set-Content -LiteralPath $manifest -Value $lines
+
+cargo build -p aw-server --release --bin aw-server
+Copy-Item .\target\release\aw-server.exe .\target\release\aw-server-rust.exe
 ```
 
 Run datastore tests:
@@ -149,7 +177,7 @@ By default, production-copy verification reads:
 %LOCALAPPDATA%\activitywatch\aw-server-rust\sqlite.db
 ```
 
-The script does not modify the production database directly. It copies the database to `tmp-local-test\sqlite-prod-copy.db` with SQLite's backup API, starts the downloaded `aw-server.exe` against that copy, then checks the schema, index, HTTP query timing, and SQLite query plan.
+The script does not modify the production database directly. It copies the database to `tmp-local-test\sqlite-prod-copy.db` with SQLite's backup API, starts the downloaded server binary against that copy, then checks the schema, index, HTTP query timing, and SQLite query plan.
 
 Common parameters:
 
@@ -181,7 +209,7 @@ Recommended flow:
    .\scripts\verify-ci-artifact.ps1 -VerifyProductionCopy -Cleanup
    ```
 
-4. Start the real service with an `aw-server.exe` built from this branch so it migrates the real database.
+4. Replace the installed `aw-server-rust.exe` with the `aw-server-rust.exe` built from this branch, then start ActivityWatch so it migrates the real database.
 5. Confirm the schema version and index after migration:
 
    ```powershell
