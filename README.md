@@ -109,7 +109,21 @@ cargo test -p aw-datastore
 
 ### Cloud artifact verification
 
-The verification script requires `git`, `gh`, and `python`. The GitHub CLI must already be logged in.
+The verification script requires `git` and `python`. It does not require GitHub CLI for normal artifact verification.
+
+For public repositories, the script first tries unauthenticated GitHub API requests. If GitHub rejects anonymous artifact access or rate limits the request, set one of these environment variables before running it:
+
+```powershell
+$env:GH_TOKEN = "<github-token>"
+```
+
+or:
+
+```powershell
+$env:GITHUB_TOKEN = "<github-token>"
+```
+
+A fine-grained token with read access to repository Actions is enough. The token is only used for GitHub API and artifact download requests.
 
 Download the latest successful `Build` artifact for the current branch, then verify server startup, `user_version = 5`, and the new index column order on a temporary fresh database:
 
@@ -143,6 +157,7 @@ Common parameters:
 - `-RunId <id>`: download the artifact from a specific Actions run.
 - `-ArtifactName <name>`: override the artifact name, defaulting to `binaries-Windows`.
 - `-Port <port>`: override the test server port, defaulting to `5666`.
+- `-GitHubToken <token>`: pass a token directly instead of using `GH_TOKEN` or `GITHUB_TOKEN`.
 - `-ProductionDbPath <path>`: use a specific production database path.
 - `-Bucket <name>`, `-Start <iso>`, `-End <iso>`, `-Limit <n>`: control the production-copy query range.
 - `-Cleanup`: remove `.ci-bin` and `tmp-local-test` after verification.

@@ -10,6 +10,7 @@ param(
     [int]$Port = 5666,
     [int]$TimeoutSeconds = 120,
     [int]$DownloadTimeoutSeconds = 600,
+    [string]$GitHubToken = "",
     [switch]$VerifyProductionCopy,
     [string]$ProductionDbPath = "",
     [string]$Bucket = "",
@@ -23,6 +24,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $ScriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$Script:TestServerProcesses = New-Object System.Collections.Generic.List[System.Diagnostics.Process]
 
 function Write-Log {
     param([string]$Message)
@@ -40,7 +42,6 @@ function Require-Command {
 }
 
 Require-Command git
-Require-Command gh
 Require-Command python
 
 $RepoRootRaw = (& git rev-parse --show-toplevel).Trim()
@@ -50,6 +51,18 @@ if ([string]::IsNullOrWhiteSpace($RepoRootRaw)) {
 $RepoRoot = [System.IO.Path]::GetFullPath($RepoRootRaw)
 Set-Location $RepoRoot
 Write-Log "Repository root: $RepoRoot"
+
+if ([string]::IsNullOrWhiteSpace($GitHubToken)) {
+    if (-not [string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+        $GitHubToken = $env:GH_TOKEN
+        Write-Log "Using GitHub token from GH_TOKEN"
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+        $GitHubToken = $env:GITHUB_TOKEN
+        Write-Log "Using GitHub token from GITHUB_TOKEN"
+    } else {
+        Write-Log "No GitHub token found; trying unauthenticated GitHub API requests"
+    }
+}
 
 function Resolve-InRepo {
     param([string]$Path)
@@ -74,8 +87,175 @@ function Remove-InRepoDirectory {
 
     $full = Resolve-InRepo $Path
     if (Test-Path -LiteralPath $full) {
-        Remove-Item -LiteralPath $full -Recurse -Force
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+                Remove-Item -LiteralPath $full -Recurse -Force
+                return
+            } catch {
+                if ($attempt -eq 5) {
+                    throw
+                }
+                Write-Log "Failed to remove $full; retrying in 1 second ($attempt/5): $($_.Exception.Message)"
+                Start-Sleep -Seconds 1
+            }
+        }
     }
+}
+
+function Invoke-PythonScript {
+    param(
+        [string]$Script,
+        [string[]]$Arguments = @(),
+        [string]$Description = "Python helper"
+    )
+
+    $pythonArgs = @("-") + $Arguments
+    $output = $Script | & python @pythonArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description failed: $($output -join [Environment]::NewLine)"
+    }
+
+    $output
+}
+
+function Get-RepoParts {
+    if ($Repo -notmatch "^[^/]+/[^/]+$") {
+        throw "Repo must be in owner/name format, got: $Repo"
+    }
+
+    $parts = $Repo.Split("/", 2)
+    [pscustomobject]@{
+        Owner = $parts[0]
+        Name = $parts[1]
+    }
+}
+
+function Get-GitHubHeaders {
+    $headers = @{
+        Accept = "application/vnd.github+json"
+        "X-GitHub-Api-Version" = "2022-11-28"
+        "User-Agent" = "aw-server-rust-artifact-verifier"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($GitHubToken)) {
+        $headers.Authorization = "Bearer $GitHubToken"
+    }
+
+    $headers
+}
+
+function Get-ResponseHeader {
+    param(
+        [object]$Response,
+        [string]$Name
+    )
+
+    if (-not $Response -or -not $Response.Headers) {
+        return ""
+    }
+
+    $values = $null
+    try {
+        if ($Response.Headers.TryGetValues($Name, [ref]$values)) {
+            return ($values -join ", ")
+        }
+    } catch {
+        return ""
+    }
+
+    ""
+}
+
+function Format-RateLimitReset {
+    param([string]$ResetEpoch)
+
+    if ([string]::IsNullOrWhiteSpace($ResetEpoch)) {
+        return ""
+    }
+
+    try {
+        $reset = [DateTimeOffset]::FromUnixTimeSeconds([int64]$ResetEpoch).LocalDateTime
+        return $reset.ToString("yyyy-MM-dd HH:mm:ss")
+    } catch {
+        return ""
+    }
+}
+
+function Invoke-GitHubApi {
+    param([string]$PathAndQuery)
+
+    $uri = if ($PathAndQuery.StartsWith("https://", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $PathAndQuery
+    } else {
+        "https://api.github.com$PathAndQuery"
+    }
+
+    try {
+        $request = @{
+            Uri = $uri
+            Headers = (Get-GitHubHeaders)
+            TimeoutSec = 60
+        }
+
+        Invoke-RestMethod @request
+    } catch {
+        $statusCode = $null
+        $response = $null
+        $responseProperty = $_.Exception.PSObject.Properties["Response"]
+        if ($responseProperty -and $responseProperty.Value -and $responseProperty.Value.StatusCode) {
+            $response = $responseProperty.Value
+            $statusCode = [int]$responseProperty.Value.StatusCode
+        }
+
+        $rateRemaining = Get-ResponseHeader -Response $response -Name "x-ratelimit-remaining"
+        $rateReset = Get-ResponseHeader -Response $response -Name "x-ratelimit-reset"
+        $rateResetLocal = Format-RateLimitReset -ResetEpoch $rateReset
+        $message = $_.Exception.Message
+        $isRateLimited = $statusCode -eq 403 -and (
+            $message -match "rate limit" -or
+            $rateRemaining -eq "0"
+        )
+
+        if ($isRateLimited -and [string]::IsNullOrWhiteSpace($GitHubToken)) {
+            $resetHint = if ([string]::IsNullOrWhiteSpace($rateResetLocal)) {
+                ""
+            } else {
+                " The anonymous limit resets around $rateResetLocal."
+            }
+            throw "GitHub anonymous API rate limit exceeded for $uri.$resetHint Set a token for this PowerShell session, then rerun: `$env:GH_TOKEN = '<github-token>'"
+        }
+
+        $authHint = if ([string]::IsNullOrWhiteSpace($GitHubToken)) {
+            " Set GH_TOKEN or GITHUB_TOKEN if GitHub rejects anonymous artifact access."
+        } else {
+            " Check that the token has Actions read access for $Repo."
+        }
+        throw "GitHub API request failed ($statusCode): $uri.$authHint $message"
+    }
+}
+
+function Resolve-WorkflowId {
+    $repoParts = Get-RepoParts
+    $encodedOwner = [System.Uri]::EscapeDataString($repoParts.Owner)
+    $encodedRepo = [System.Uri]::EscapeDataString($repoParts.Name)
+    $workflows = Invoke-GitHubApi "/repos/$encodedOwner/$encodedRepo/actions/workflows?per_page=100"
+
+    $workflowMatch = $workflows.workflows |
+        Where-Object {
+            $_.name -eq $Workflow -or
+            $_.path -eq ".github/workflows/$Workflow" -or
+            [System.IO.Path]::GetFileName($_.path) -eq $Workflow -or
+            [string]$_.id -eq $Workflow
+        } |
+        Select-Object -First 1
+
+    if (-not $workflowMatch) {
+        $available = ($workflows.workflows | ForEach-Object { "$($_.name) ($([System.IO.Path]::GetFileName($_.path)))" }) -join ", "
+        throw "Workflow '$Workflow' was not found in $Repo. Available workflows: $available"
+    }
+
+    Write-Log "Resolved workflow '$Workflow' to id $($workflowMatch.id) ($($workflowMatch.name))"
+    $workflowMatch.id
 }
 
 function Get-LatestSuccessfulRunId {
@@ -88,23 +268,21 @@ function Get-LatestSuccessfulRunId {
     }
 
     Write-Log "Looking for latest successful '$Workflow' run on branch '$script:Branch' in $Repo"
-    $runJson = gh run list `
-        --repo $Repo `
-        --workflow $Workflow `
-        --branch $script:Branch `
-        --status success `
-        --limit 1 `
-        --json databaseId,headSha,url,displayTitle,updatedAt `
-        --jq ".[0]"
+    $repoParts = Get-RepoParts
+    $encodedOwner = [System.Uri]::EscapeDataString($repoParts.Owner)
+    $encodedRepo = [System.Uri]::EscapeDataString($repoParts.Name)
+    $encodedBranch = [System.Uri]::EscapeDataString($script:Branch)
+    $workflowId = Resolve-WorkflowId
+    $runs = Invoke-GitHubApi "/repos/$encodedOwner/$encodedRepo/actions/workflows/$workflowId/runs?branch=$encodedBranch&status=success&per_page=1"
+    $run = $runs.workflow_runs | Select-Object -First 1
 
-    if ([string]::IsNullOrWhiteSpace($runJson) -or $runJson -eq "null") {
+    if (-not $run) {
         throw "No successful '$Workflow' workflow run found for branch '$script:Branch'. Pass -RunId after CI completes."
     }
 
-    $run = $runJson | ConvertFrom-Json
-    Write-Log "Using run $($run.databaseId): $($run.displayTitle) at $($run.headSha)"
-    Write-Log "Run URL: $($run.url)"
-    [string]$run.databaseId
+    Write-Log "Using run $($run.id): $($run.display_title) at $($run.head_sha)"
+    Write-Log "Run URL: $($run.html_url)"
+    [string]$run.id
 }
 
 function Download-Artifact {
@@ -117,37 +295,70 @@ function Download-Artifact {
     $downloadPath = Resolve-InRepo $Destination
     New-Item -ItemType Directory -Force $downloadPath | Out-Null
 
-    $downloadStdout = Join-Path $downloadPath "gh-download.stdout.log"
-    $downloadStderr = Join-Path $downloadPath "gh-download.stderr.log"
-    $downloadArgs = @("run", "download", $ResolvedRunId, "--repo", $Repo, "-n", $ArtifactName, "-D", $downloadPath)
-    Write-Log "Downloading artifact '$ArtifactName' from run $ResolvedRunId into $downloadPath"
-    Write-Log "Download timeout: $DownloadTimeoutSeconds seconds; logs: $downloadStdout / $downloadStderr"
-    $downloadProcess = Start-Process `
-        -FilePath "gh" `
-        -ArgumentList $downloadArgs `
-        -RedirectStandardOutput $downloadStdout `
-        -RedirectStandardError $downloadStderr `
-        -WindowStyle Hidden `
-        -PassThru
+    Write-Log "Resolving artifact metadata before download"
+    $repoParts = Get-RepoParts
+    $encodedOwner = [System.Uri]::EscapeDataString($repoParts.Owner)
+    $encodedRepo = [System.Uri]::EscapeDataString($repoParts.Name)
+    $artifacts = Invoke-GitHubApi "/repos/$encodedOwner/$encodedRepo/actions/runs/$ResolvedRunId/artifacts?per_page=100"
+    $artifact = $artifacts.artifacts |
+        Where-Object { $_.name -eq $ArtifactName } |
+        Select-Object -First 1
+
+    if (-not $artifact) {
+        throw "Artifact '$ArtifactName' was not found in run $ResolvedRunId"
+    }
+    if ($artifact.expired) {
+        throw "Artifact '$ArtifactName' from run $ResolvedRunId has expired"
+    }
+    $artifactSizeMb = [math]::Round($artifact.size_in_bytes / 1MB, 2)
+    Write-Log "Artifact id: $($artifact.id); compressed size: $artifactSizeMb MB"
+
+    $zipPath = Join-Path $downloadPath "$ArtifactName.zip"
+    if (Test-Path -LiteralPath $zipPath) {
+        Remove-Item -LiteralPath $zipPath -Force
+    }
+    Write-Log "Downloading artifact zip into $zipPath"
+    Write-Log "Download timeout: $DownloadTimeoutSeconds seconds"
 
     $downloadStarted = [System.Diagnostics.Stopwatch]::StartNew()
+    $downloadJob = Start-Job -ScriptBlock {
+        param($Uri, $OutFile, $Headers)
+        Invoke-WebRequest -Uri $Uri -Headers $Headers -OutFile $OutFile -MaximumRedirection 10
+    } -ArgumentList $artifact.archive_download_url, $zipPath, (Get-GitHubHeaders)
+
     $nextNoticeSeconds = 30
-    while (-not $downloadProcess.WaitForExit(5000)) {
+    while ($downloadJob.State -in @("NotStarted", "Running")) {
+        Start-Sleep -Seconds 5
         $elapsedSeconds = [int]$downloadStarted.Elapsed.TotalSeconds
         if ($elapsedSeconds -ge $DownloadTimeoutSeconds) {
-            Stop-Process -Id $downloadProcess.Id -Force
-            throw "Timed out downloading artifact '$ArtifactName' from run $ResolvedRunId after $DownloadTimeoutSeconds seconds. Logs: $downloadStdout / $downloadStderr"
+            Stop-Job -Job $downloadJob
+            Remove-Job -Job $downloadJob -Force
+            throw "Timed out downloading artifact '$ArtifactName' from run $ResolvedRunId after $DownloadTimeoutSeconds seconds"
         }
+
         if ($elapsedSeconds -ge $nextNoticeSeconds) {
+            $partialSize = if (Test-Path -LiteralPath $zipPath) {
+                [math]::Round((Get-Item -LiteralPath $zipPath).Length / 1MB, 2)
+            } else {
+                0
+            }
             Write-Log "Still downloading artifact '$ArtifactName' ($elapsedSeconds seconds elapsed)"
+            Write-Log "Current zip size: $partialSize MB"
             $nextNoticeSeconds += 30
         }
     }
-    if ($downloadProcess.ExitCode -ne 0) {
-        $stderr = if (Test-Path -LiteralPath $downloadStderr) { Get-Content -Raw $downloadStderr } else { "" }
-        throw "Failed to download artifact '$ArtifactName' from run $ResolvedRunId. $stderr"
+
+    try {
+        Receive-Job -Job $downloadJob -ErrorAction Stop | Out-Null
+    } finally {
+        Remove-Job -Job $downloadJob -Force
     }
     Write-Log "Artifact download finished in $($downloadStarted.Elapsed.ToString('hh\:mm\:ss'))"
+
+    $zipSizeMb = [math]::Round((Get-Item -LiteralPath $zipPath).Length / 1MB, 2)
+    Write-Log "Downloaded zip size: $zipSizeMb MB"
+    Write-Log "Extracting artifact zip"
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $downloadPath -Force
 
     $binary = Get-ChildItem -LiteralPath $downloadPath -Recurse -Filter aw-server.exe |
         Select-Object -First 1
@@ -215,6 +426,8 @@ function Start-TestServer {
         -RedirectStandardError $stderrLog `
         -PassThru
 
+    $Script:TestServerProcesses.Add($process)
+
     try {
         $info = Wait-ForServer -Process $process -ServerPort $Port
         [pscustomobject]@{
@@ -236,8 +449,21 @@ function Stop-TestServer {
     param([System.Diagnostics.Process]$Process)
 
     if ($Process -and -not $Process.HasExited) {
+        Write-Log "Stopping aw-server process $($Process.Id)"
         Stop-Process -Id $Process.Id -Force
         Wait-Process -Id $Process.Id -Timeout 10 -ErrorAction SilentlyContinue
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            Write-Log "aw-server process $($Process.Id) stopped"
+        } else {
+            Write-Log "aw-server process $($Process.Id) did not exit within 10 seconds"
+        }
+    }
+}
+
+function Stop-AllTestServers {
+    foreach ($process in @($Script:TestServerProcesses)) {
+        Stop-TestServer -Process $process
     }
 }
 
@@ -261,7 +487,11 @@ if columns != ["bucketrow", "endtime", "starttime"]:
     raise SystemExit(f"unexpected index columns: {columns}")
 '@
 
-    ($script | python - $Database) | ConvertFrom-Json
+    $output = Invoke-PythonScript `
+        -Script $script `
+        -Arguments @($Database) `
+        -Description "SQLite schema/index check"
+    $output | ConvertFrom-Json -DateKind String
 }
 
 function Backup-SqliteDatabase {
@@ -294,7 +524,11 @@ source.close()
 print(f"{time.perf_counter() - started:.2f}")
 '@
 
-    [double]($script | python - $Source $Destination)
+    $output = Invoke-PythonScript `
+        -Script $script `
+        -Arguments @($Source, $Destination) `
+        -Description "SQLite production database backup"
+    [double]$output
 }
 
 function Get-DefaultQuery {
@@ -343,7 +577,28 @@ if not start:
 print(json.dumps({"bucket": bucket, "bucketrow": bucketrow, "start": start, "end": end}))
 '@
 
-    ($script | python - $Database $Bucket $Start $End) | ConvertFrom-Json
+    $output = Invoke-PythonScript `
+        -Script $script `
+        -Arguments @($Database, $Bucket, $Start, $End) `
+        -Description "Representative query selection"
+    $output | ConvertFrom-Json -DateKind String
+}
+
+function Wait-ForSqliteIndex {
+    param([string]$Database)
+
+    $lastError = ""
+    for ($attempt = 1; $attempt -le 12; $attempt++) {
+        try {
+            return Test-SqliteIndex -Database $Database
+        } catch {
+            $lastError = $_.Exception.Message
+            Write-Log "SQLite migration/index is not visible yet ($attempt/12): $lastError"
+            Start-Sleep -Seconds 3
+        }
+    }
+
+    throw "SQLite migration/index did not become visible in $Database. Last check: $lastError"
 }
 
 function Test-ProductionCopyQuery {
@@ -353,7 +608,9 @@ function Test-ProductionCopyQuery {
     )
 
     $encodedBucket = [System.Uri]::EscapeDataString($Query.bucket)
-    $uri = "http://127.0.0.1:$Port/api/0/buckets/$encodedBucket/events?start=$($Query.start)&end=$($Query.end)&limit=$Limit"
+    $encodedStart = [System.Uri]::EscapeDataString([string]$Query.start)
+    $encodedEnd = [System.Uri]::EscapeDataString([string]$Query.end)
+    $uri = "http://127.0.0.1:$Port/api/0/buckets/$encodedBucket/events?start=$encodedStart&end=$encodedEnd&limit=$Limit"
     $results = @()
 
     Write-Log "Running HTTP query verification for bucket '$($Query.bucket)'"
@@ -404,7 +661,11 @@ count = conn.execute("""
 print(json.dumps({"count": count, "plan": plan}))
 '@
 
-    $plan = ($script | python - $Database $Query.bucket $Query.start $Query.end $Limit) | ConvertFrom-Json
+    $output = Invoke-PythonScript `
+        -Script $script `
+        -Arguments @($Database, $Query.bucket, $Query.start, $Query.end, [string]$Limit) `
+        -Description "SQLite production query plan check"
+    $plan = $output | ConvertFrom-Json -DateKind String
     [pscustomobject]@{
         Query = $Query
         HttpResults = $results
@@ -463,7 +724,7 @@ try {
 
         $prodServer = Start-TestServer -Binary $binary -Database $copyDb -Label "production-copy"
         try {
-            $copyCheck = Test-SqliteIndex -Database $copyDb
+            $copyCheck = Wait-ForSqliteIndex -Database $copyDb
             $query = Get-DefaultQuery -Database $copyDb
             $queryResult = Test-ProductionCopyQuery -Database $copyDb -Query $query
 
@@ -486,6 +747,7 @@ try {
         Write-Log "Skipping production copy verification. Add -VerifyProductionCopy to test against a copied local ActivityWatch database."
     }
 } finally {
+    Stop-AllTestServers
     if ($Cleanup) {
         Write-Log "Cleanup requested; removing temporary directories"
         Remove-InRepoDirectory $DownloadDir
