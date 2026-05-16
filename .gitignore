@@ -2,6 +2,7 @@ target
 dist
 .cargo/config
 NDK
+/.codex/
 
 **/*.rs.bk
 *.zip
