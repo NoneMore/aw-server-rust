@@ -9,7 +9,7 @@ param(
     [string]$WorkDir = "tmp-local-test",
     [int]$Port = 5666,
     [int]$TimeoutSeconds = 120,
-    [int]$DownloadTimeoutSeconds = 180,
+    [int]$DownloadTimeoutSeconds = 600,
     [switch]$VerifyProductionCopy,
     [string]$ProductionDbPath = "",
     [string]$Bucket = "",
@@ -21,6 +21,15 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+$ScriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Write-Log {
+    param([string]$Message)
+
+    $elapsed = $ScriptStopwatch.Elapsed.ToString("hh\:mm\:ss")
+    Write-Host "[$elapsed] $Message"
+}
 
 function Require-Command {
     param([string]$Name)
@@ -40,6 +49,7 @@ if ([string]::IsNullOrWhiteSpace($RepoRootRaw)) {
 }
 $RepoRoot = [System.IO.Path]::GetFullPath($RepoRootRaw)
 Set-Location $RepoRoot
+Write-Log "Repository root: $RepoRoot"
 
 function Resolve-InRepo {
     param([string]$Path)
@@ -71,11 +81,13 @@ function Remove-InRepoDirectory {
 function Get-LatestSuccessfulRunId {
     if ([string]::IsNullOrWhiteSpace($Branch)) {
         $script:Branch = (& git branch --show-current).Trim()
+        Write-Log "Inferred current branch: $script:Branch"
     }
     if ([string]::IsNullOrWhiteSpace($script:Branch)) {
         throw "Unable to infer current git branch. Pass -Branch or -RunId."
     }
 
+    Write-Log "Looking for latest successful '$Workflow' run on branch '$script:Branch' in $Repo"
     $runJson = gh run list `
         --repo $Repo `
         --workflow $Workflow `
@@ -90,7 +102,8 @@ function Get-LatestSuccessfulRunId {
     }
 
     $run = $runJson | ConvertFrom-Json
-    Write-Host "Using run $($run.databaseId) for $($run.displayTitle) at $($run.headSha)"
+    Write-Log "Using run $($run.databaseId): $($run.displayTitle) at $($run.headSha)"
+    Write-Log "Run URL: $($run.url)"
     [string]$run.databaseId
 }
 
@@ -107,6 +120,8 @@ function Download-Artifact {
     $downloadStdout = Join-Path $downloadPath "gh-download.stdout.log"
     $downloadStderr = Join-Path $downloadPath "gh-download.stderr.log"
     $downloadArgs = @("run", "download", $ResolvedRunId, "--repo", $Repo, "-n", $ArtifactName, "-D", $downloadPath)
+    Write-Log "Downloading artifact '$ArtifactName' from run $ResolvedRunId into $downloadPath"
+    Write-Log "Download timeout: $DownloadTimeoutSeconds seconds; logs: $downloadStdout / $downloadStderr"
     $downloadProcess = Start-Process `
         -FilePath "gh" `
         -ArgumentList $downloadArgs `
@@ -115,14 +130,24 @@ function Download-Artifact {
         -WindowStyle Hidden `
         -PassThru
 
-    if (-not $downloadProcess.WaitForExit($DownloadTimeoutSeconds * 1000)) {
-        Stop-Process -Id $downloadProcess.Id -Force
-        throw "Timed out downloading artifact '$ArtifactName' from run $ResolvedRunId after $DownloadTimeoutSeconds seconds. Logs: $downloadStdout / $downloadStderr"
+    $downloadStarted = [System.Diagnostics.Stopwatch]::StartNew()
+    $nextNoticeSeconds = 30
+    while (-not $downloadProcess.WaitForExit(5000)) {
+        $elapsedSeconds = [int]$downloadStarted.Elapsed.TotalSeconds
+        if ($elapsedSeconds -ge $DownloadTimeoutSeconds) {
+            Stop-Process -Id $downloadProcess.Id -Force
+            throw "Timed out downloading artifact '$ArtifactName' from run $ResolvedRunId after $DownloadTimeoutSeconds seconds. Logs: $downloadStdout / $downloadStderr"
+        }
+        if ($elapsedSeconds -ge $nextNoticeSeconds) {
+            Write-Log "Still downloading artifact '$ArtifactName' ($elapsedSeconds seconds elapsed)"
+            $nextNoticeSeconds += 30
+        }
     }
     if ($downloadProcess.ExitCode -ne 0) {
         $stderr = if (Test-Path -LiteralPath $downloadStderr) { Get-Content -Raw $downloadStderr } else { "" }
         throw "Failed to download artifact '$ArtifactName' from run $ResolvedRunId. $stderr"
     }
+    Write-Log "Artifact download finished in $($downloadStarted.Elapsed.ToString('hh\:mm\:ss'))"
 
     $binary = Get-ChildItem -LiteralPath $downloadPath -Recurse -Filter aw-server.exe |
         Select-Object -First 1
@@ -130,6 +155,8 @@ function Download-Artifact {
         throw "Artifact '$ArtifactName' did not contain aw-server.exe under $downloadPath"
     }
 
+    $binarySizeMb = [math]::Round($binary.Length / 1MB, 2)
+    Write-Log "Found aw-server.exe at $($binary.FullName) ($binarySizeMb MB)"
     $binary.FullName
 }
 
@@ -139,14 +166,20 @@ function Wait-ForServer {
         [int]$ServerPort
     )
 
+    Write-Log "Waiting up to $TimeoutSeconds seconds for aw-server on port $ServerPort"
     for ($i = 0; $i -lt $TimeoutSeconds; $i++) {
         if ($Process.HasExited) {
             throw "aw-server exited early with code $($Process.ExitCode)"
         }
 
         try {
-            return Invoke-RestMethod -Uri "http://127.0.0.1:$ServerPort/api/0/info" -TimeoutSec 2
+            $info = Invoke-RestMethod -Uri "http://127.0.0.1:$ServerPort/api/0/info" -TimeoutSec 2
+            Write-Log "aw-server responded on port $ServerPort"
+            return $info
         } catch {
+            if ($i -gt 0 -and ($i % 10) -eq 0) {
+                Write-Log "Still waiting for aw-server on port $ServerPort ($i seconds elapsed)"
+            }
             Start-Sleep -Seconds 1
         }
     }
@@ -171,6 +204,9 @@ function Start-TestServer {
         throw "Port $Port is already in use. Pass -Port with a free port."
     }
 
+    Write-Log "Starting aw-server for '$Label' on port $Port"
+    Write-Log "Database: $Database"
+    Write-Log "Server logs: $stdoutLog / $stderrLog"
     $process = Start-Process `
         -FilePath $Binary `
         -ArgumentList @("--testing", "--port", [string]$Port, "--dbpath", $Database, "--verbose") `
@@ -208,6 +244,7 @@ function Stop-TestServer {
 function Test-SqliteIndex {
     param([string]$Database)
 
+    Write-Log "Checking SQLite schema version and event query index in $Database"
     $script = @'
 import json
 import sqlite3
@@ -240,6 +277,8 @@ function Backup-SqliteDatabase {
         Remove-Item -LiteralPath $Destination -Force
     }
 
+    Write-Log "Copying production database from $Source"
+    Write-Log "Production copy destination: $Destination"
     $script = @'
 import sqlite3
 import sys
@@ -261,6 +300,7 @@ print(f"{time.perf_counter() - started:.2f}")
 function Get-DefaultQuery {
     param([string]$Database)
 
+    Write-Log "Selecting representative bucket and 24-hour query range"
     $script = @'
 import json
 import sqlite3
@@ -316,10 +356,13 @@ function Test-ProductionCopyQuery {
     $uri = "http://127.0.0.1:$Port/api/0/buckets/$encodedBucket/events?start=$($Query.start)&end=$($Query.end)&limit=$Limit"
     $results = @()
 
+    Write-Log "Running HTTP query verification for bucket '$($Query.bucket)'"
+    Write-Log "Range: $($Query.start) -> $($Query.end); limit: $Limit"
     for ($i = 1; $i -le 3; $i++) {
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $response = Invoke-WebRequest -Uri $uri -TimeoutSec 60
         $sw.Stop()
+        Write-Log "HTTP query run $i returned $($response.StatusCode) in $($sw.ElapsedMilliseconds) ms"
         $results += [pscustomobject]@{
             Run = $i
             StatusCode = $response.StatusCode
@@ -328,6 +371,7 @@ function Test-ProductionCopyQuery {
         }
     }
 
+    Write-Log "Checking SQLite query plan and matching row count"
     $script = @'
 import json
 import sqlite3
@@ -370,23 +414,31 @@ print(json.dumps({"count": count, "plan": plan}))
 
 $DownloadPath = Resolve-InRepo $DownloadDir
 $WorkPath = Resolve-InRepo $WorkDir
+Write-Log "GitHub repo: $Repo"
+Write-Log "Workflow: $Workflow; artifact: $ArtifactName"
+Write-Log "Download directory: $DownloadPath"
+Write-Log "Work directory: $WorkPath"
 
 try {
     if ([string]::IsNullOrWhiteSpace($RunId)) {
+        Write-Log "No -RunId supplied; resolving latest successful workflow run"
         $RunId = Get-LatestSuccessfulRunId
+    } else {
+        Write-Log "Using explicit workflow run id: $RunId"
     }
 
     $binary = Download-Artifact -ResolvedRunId $RunId -Destination $DownloadDir
-    Write-Host "Downloaded aw-server.exe: $binary"
+    Write-Log "Downloaded aw-server.exe: $binary"
 
     Remove-InRepoDirectory $WorkDir
     New-Item -ItemType Directory -Force $WorkPath | Out-Null
 
+    Write-Log "Preparing fresh database smoke test"
     $freshDb = Join-Path $WorkPath "sqlite-smoke.db"
     $freshServer = Start-TestServer -Binary $binary -Database $freshDb -Label "fresh"
     try {
         $freshCheck = Test-SqliteIndex -Database $freshDb
-        Write-Host "Fresh database verification passed"
+        Write-Log "Fresh database verification passed"
         [pscustomobject]@{
             Kind = "fresh"
             Testing = $freshServer.Info.testing
@@ -404,9 +456,10 @@ try {
             $ProductionDbPath = Join-Path $env:LOCALAPPDATA "activitywatch\aw-server-rust\sqlite.db"
         }
 
+        Write-Log "Preparing production database copy verification"
         $copyDb = Join-Path $WorkPath "sqlite-prod-copy.db"
         $backupSeconds = Backup-SqliteDatabase -Source $ProductionDbPath -Destination $copyDb
-        Write-Host "Production database copy created in $backupSeconds seconds"
+        Write-Log "Production database copy created in $backupSeconds seconds"
 
         $prodServer = Start-TestServer -Binary $binary -Database $copyDb -Label "production-copy"
         try {
@@ -414,7 +467,7 @@ try {
             $query = Get-DefaultQuery -Database $copyDb
             $queryResult = Test-ProductionCopyQuery -Database $copyDb -Query $query
 
-            Write-Host "Production copy verification passed"
+            Write-Log "Production copy verification passed"
             [pscustomobject]@{
                 Kind = "production-copy"
                 Database = $copyDb
@@ -429,10 +482,17 @@ try {
         } finally {
             Stop-TestServer -Process $prodServer.Process
         }
+    } else {
+        Write-Log "Skipping production copy verification. Add -VerifyProductionCopy to test against a copied local ActivityWatch database."
     }
 } finally {
     if ($Cleanup) {
+        Write-Log "Cleanup requested; removing temporary directories"
         Remove-InRepoDirectory $DownloadDir
         Remove-InRepoDirectory $WorkDir
+        Write-Log "Cleanup complete"
+    } else {
+        Write-Log "Temporary files kept in $DownloadPath and $WorkPath"
     }
+    Write-Log "Verification script finished in $($ScriptStopwatch.Elapsed.ToString('hh\:mm\:ss'))"
 }

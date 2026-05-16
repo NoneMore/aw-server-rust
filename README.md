@@ -1,47 +1,184 @@
-aw-server-rust
-==============
+# aw-server-rust
 
-[![Build Status](https://github.com/ActivityWatch/aw-server-rust/workflows/Build/badge.svg?branch=master)](https://github.com/ActivityWatch/aw-server-rust/actions?query=workflow%3ABuild+branch%3Amaster)
-[![Coverage Status](https://codecov.io/gh/ActivityWatch/aw-server-rust/branch/master/graph/badge.svg)](https://codecov.io/gh/ActivityWatch/aw-server-rust)
-[![Dependency Status](https://deps.rs/repo/github/activitywatch/aw-server-rust/status.svg)](https://deps.rs/repo/github/activitywatch/aw-server-rust)
+[![Build](https://github.com/NoneMore/aw-server-rust/actions/workflows/build.yml/badge.svg?branch=my-v0.13.2-server-patch)](https://github.com/NoneMore/aw-server-rust/actions/workflows/build.yml?query=branch%3Amy-v0.13.2-server-patch)
+[![Lint](https://github.com/NoneMore/aw-server-rust/actions/workflows/lint.yml/badge.svg?branch=my-v0.13.2-server-patch)](https://github.com/NoneMore/aw-server-rust/actions/workflows/lint.yml?query=branch%3Amy-v0.13.2-server-patch)
 
 A reimplementation of aw-server in Rust.
 
-Features missing compared to the Python implementation of aw-server:
+## Branch notes
 
- - API explorer (Swagger/OpenAPI)
+This branch, `my-v0.13.2-server-patch`, is tuned for a local Windows ActivityWatch setup. Its main goal is to make event range queries fast on large SQLite databases, while keeping CI small and focused on what this fork needs.
 
-### How to compile
+### What changed
 
-Build with `cargo`:
+- The SQLite schema version is upgraded from `user_version = 4` to `user_version = 5`.
+- A composite index was added: `events_bucketrow_endtime_starttime_index` on `events(bucketrow, endtime, starttime)`.
+- `get_events` and `get_event_count` explicitly use the composite index so large-bucket queries do not fall back to inefficient plans.
+- Datastore tests cover fresh database creation, v4 to v5 migration, index column order, and the SQL index constraint.
+- GitHub Actions was reduced to a lightweight CI setup: Windows builds `aw-server` and runs `aw-datastore` tests; Linux runs `fmt` and `clippy`.
+- `scripts/verify-ci-artifact.ps1` downloads the cloud-built artifact and verifies it locally against a fresh database, with an optional production database copy check.
 
-```sh
-cargo build --release
+### Why this changed
+
+The previous schema only had bucket-oriented indexing. On databases where one bucket contains a very large number of events, SQLite could scan many rows from that bucket before applying the time range filter and ordering. This made endpoints such as `/api/0/buckets/<bucket>/events` slow on large local datasets.
+
+This branch puts the common query shape, `bucketrow + endtime/starttime`, into one index. That lets SQLite locate the bucket and narrow the scan by time range. The CI setup was also reduced to the checks that are useful for this fork, which lowers wait time and Actions usage.
+
+### Observed result
+
+The v4 to v5 migration and query plan were verified on a local copy of a production database. On that database, the largest bucket had about 2.88 million events. A direct SQL query over a 24-hour range went from about 1.2 to 1.5 seconds when forced onto the old index to about 5 ms with the new composite index. Warmed HTTP queries were about 10 to 21 ms.
+
+These numbers are local validation results, not a cross-machine performance guarantee. The important checks are that the query plan uses `events_bucketrow_endtime_starttime_index` and that large-bucket time range queries no longer perform broad scans.
+
+## Build
+
+### Cloud build
+
+The GitHub Actions `Build` workflow runs these commands on a Windows runner:
+
+```powershell
+cargo build -p aw-server --verbose
+cargo test -p aw-datastore --verbose
 ```
 
-You can also build with make, which will build the web assets as well:
+On success, it uploads this artifact:
 
-```
-make build
-```
-
-Your built executable will be located in `./target/release/aw-server-rust`. If you want to use it with a development version of `aw-qt` you'll want to copy this binary into your `venv`:
-
-```shell
-cp target/release/aw-server ../venv/bin/aw-server-rust
+```text
+binaries-Windows/aw-server.exe
 ```
 
+Trigger a cloud build for this branch:
 
-### How to run
+```powershell
+gh workflow run Build --repo NoneMore/aw-server-rust --ref my-v0.13.2-server-patch
+gh run watch --repo NoneMore/aw-server-rust
+```
 
-If you want to quick-compile for debugging, run cargo run from the project root:
+The `Lint` workflow runs formatting and clippy checks separately:
 
-```sh
+```powershell
+gh workflow run Lint --repo NoneMore/aw-server-rust --ref my-v0.13.2-server-patch
+gh run watch --repo NoneMore/aw-server-rust
+```
+
+### Local build
+
+Development build:
+
+```powershell
+cargo build -p aw-server
+```
+
+Release build:
+
+```powershell
+cargo build -p aw-server --release
+```
+
+Run datastore tests:
+
+```powershell
+cargo test -p aw-datastore
+```
+
+Run the server locally:
+
+```powershell
 cargo run --bin aw-server
 ```
 
-*NOTE:* This will start aw-server-rust in testing mode (on port 5666 instead of port 5600).
+Note: `cargo run --bin aw-server` from the repository root starts in testing mode on port `5666`, not the normal `5600` port.
 
-### Syncing
+## Verification and testing
+
+### Rust checks
+
+Minimum local check:
+
+```powershell
+cargo test -p aw-datastore
+```
+
+More complete local check:
+
+```powershell
+cargo fmt -- --check
+cargo clippy --workspace
+cargo test -p aw-datastore
+```
+
+### Cloud artifact verification
+
+The verification script requires `git`, `gh`, and `python`. The GitHub CLI must already be logged in.
+
+Download the latest successful `Build` artifact for the current branch, then verify server startup, `user_version = 5`, and the new index column order on a temporary fresh database:
+
+```powershell
+.\scripts\verify-ci-artifact.ps1 -Cleanup
+```
+
+Verify a specific workflow run:
+
+```powershell
+.\scripts\verify-ci-artifact.ps1 -RunId <run-id> -Cleanup
+```
+
+Also verify a production database copy:
+
+```powershell
+.\scripts\verify-ci-artifact.ps1 -VerifyProductionCopy -Cleanup
+```
+
+By default, production-copy verification reads:
+
+```text
+%LOCALAPPDATA%\activitywatch\aw-server-rust\sqlite.db
+```
+
+The script does not modify the production database directly. It copies the database to `tmp-local-test\sqlite-prod-copy.db` with SQLite's backup API, starts the downloaded `aw-server.exe` against that copy, then checks the schema, index, HTTP query timing, and SQLite query plan.
+
+Common parameters:
+
+- `-Branch <name>`: select the branch used to find the latest successful build.
+- `-RunId <id>`: download the artifact from a specific Actions run.
+- `-ArtifactName <name>`: override the artifact name, defaulting to `binaries-Windows`.
+- `-Port <port>`: override the test server port, defaulting to `5666`.
+- `-ProductionDbPath <path>`: use a specific production database path.
+- `-Bucket <name>`, `-Start <iso>`, `-End <iso>`, `-Limit <n>`: control the production-copy query range.
+- `-Cleanup`: remove `.ci-bin` and `tmp-local-test` after verification.
+
+## Migration
+
+Migration is automatic when `aw-server` opens the database. When an existing v4 database is first started with a binary from this branch, it creates `events_bucketrow_endtime_starttime_index` and updates `PRAGMA user_version` to `5`.
+
+Recommended flow:
+
+1. Stop the running ActivityWatch / aw-server process.
+2. Back up the production database:
+
+   ```powershell
+   Copy-Item "$env:LOCALAPPDATA\activitywatch\aw-server-rust\sqlite.db" "$env:LOCALAPPDATA\activitywatch\aw-server-rust\sqlite.db.bak"
+   ```
+
+3. Run the verification script against a production database copy:
+
+   ```powershell
+   .\scripts\verify-ci-artifact.ps1 -VerifyProductionCopy -Cleanup
+   ```
+
+4. Start the real service with an `aw-server.exe` built from this branch so it migrates the real database.
+5. Confirm the schema version and index after migration:
+
+   ```powershell
+   python -c "import sqlite3, os; db=os.path.expandvars(r'%LOCALAPPDATA%\activitywatch\aw-server-rust\sqlite.db'); c=sqlite3.connect(db); print(c.execute('PRAGMA user_version').fetchone()[0]); print(c.execute('PRAGMA index_info(events_bucketrow_endtime_starttime_index)').fetchall())"
+   ```
+
+Creating the index can take some time on large databases. Keep the backup until the migrated server has been verified. Older binaries may not accept a database with `user_version = 5`; to roll back, stop the service and restore the backup database file.
+
+## Upstream notes
+
+Compared with the Python implementation of aw-server, the Rust version is still missing:
+
+- API explorer (Swagger/OpenAPI)
 
 For details about aw-sync-rust, see the [README](./aw-sync/README.md) in its subdirectory.
